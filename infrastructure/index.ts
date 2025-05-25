@@ -1,10 +1,11 @@
-import * as pulumi from "@pulumi/pulumi";
+// Import the configuration settings for the current stack.
 import * as resources from '@pulumi/azure-native/resources'
 import * as containerregistry from '@pulumi/azure-native/containerregistry'
+import * as pulumi from '@pulumi/pulumi'
 import * as dockerBuild from '@pulumi/docker-build'
 import * as containerinstance from '@pulumi/azure-native/containerinstance'
+import * as cache from '@pulumi/azure-native/redis'
 
-// Import the configuration settings for the current stack.
 const config = new pulumi.Config()
 const appPath = config.require('appPath')
 const prefixName = config.require('prefixName')
@@ -27,7 +28,7 @@ const registry = new containerregistry.Registry(`${prefixName}ACR`, {
   sku: {
     name: containerregistry.SkuName.Basic,
   },
-});
+})
 
 // Get the authentication credentials for the container registry.
 const registryCredentials = containerregistry
@@ -40,24 +41,54 @@ const registryCredentials = containerregistry
       username: creds.username!,
       password: creds.passwords![0].value!,
     }
-  });
+  })
 
 // Define the container image for the service.
 const image = new dockerBuild.Image(`${prefixName}-image`, {
-  tags: [pulumi.interpolate`${registry.loginServer}/${imageName}:${imageTag}`],
-  context: { location: appPath },
-  dockerfile: { location: `${appPath}/Dockerfile` },
-//  target: 'production',
-  platforms: ['linux/amd64', 'linux/arm64'],
-  push: true,
-  registries: [
-    {
-      address: registry.loginServer,
-      username: registryCredentials.username,
-      password: registryCredentials.password,
+    tags: [pulumi.interpolate`${registry.loginServer}/${imageName}:${imageTag}`],
+    context: { location: appPath },
+    dockerfile: { location: `${appPath}Dockerfile` },
+    platforms: ['linux/amd64', 'linux/arm64'],
+    push: true,
+    buildArgs: {
+        DOCKER_BUILDKIT: '1',
     },
-  ],
-});
+    registries: [
+      {
+        address: registry.loginServer,
+        username: registryCredentials.username,
+        password: registryCredentials.password,
+      },
+    ],
+  })
+
+
+
+// Create a managed Redis service
+const redis = new cache.Redis(`${prefixName}-redis`, {
+  name: `${prefixName}-weather-cache`,
+  location: 'westus3',
+  resourceGroupName: resourceGroup.name,
+  enableNonSslPort: true,
+  redisVersion: 'Latest',
+  minimumTlsVersion: '1.2',
+  redisConfiguration: {
+    maxmemoryPolicy: 'allkeys-lru'
+  },
+  sku: {
+    name: 'Basic',
+    family: 'C',
+    capacity: 0
+  }
+})
+
+// Extract the auth creds from the deployed Redis service
+const redisAccessKey = cache
+  .listRedisKeysOutput({ name: redis.name, resourceGroupName: resourceGroup.name })
+  .apply(keys => keys.primaryKey)
+
+// Construct the Redis connection string to be passed as an environment variable in the app container
+const redisConnectionString = pulumi.interpolate`rediss://:${redisAccessKey}@${redis.hostName}:${redis.sslPort}`
 
 // Create a container group in the Azure Container App service and make it publicly accessible.
 const containerGroup = new containerinstance.ContainerGroup(
@@ -90,8 +121,12 @@ const containerGroup = new containerinstance.ContainerGroup(
           },
           {
             name: 'WEATHER_API_KEY',
-            value: 'b39ab1a2d28fa22e35442888d52d3fc6',
+            value: config.requireSecret('weatherApiKey')
           },
+          {
+            name: 'REDIS_URL',
+            value: redisConnectionString
+          }
         ],
         resources: {
           requests: {
@@ -112,12 +147,8 @@ const containerGroup = new containerinstance.ContainerGroup(
       ],
     },
   },
-);
+)
 
-
-
-export const acrServer = registry.loginServer
-export const acrUsername = registryCredentials.username
 
 // Export the service's IP address, hostname, and fully-qualified URL.
 export const hostname = containerGroup.ipAddress.apply((addr) => addr!.fqdn!)
@@ -125,3 +156,4 @@ export const ip = containerGroup.ipAddress.apply((addr) => addr!.ip!)
 export const url = containerGroup.ipAddress.apply(
   (addr) => `http://${addr!.fqdn!}:${containerPort}`,
 )
+
